@@ -1,0 +1,216 @@
+# -*- coding: utf-8 -*-
+# ============================================================================
+## Multi-Task DNN-QSAR Models for simultaneous prediction of Carcinogenicity and Genotoxicity.
+# Author: Alexa Canchola, Kunpeng Chen
+# Advisor: Wei-Chun Chou
+# Date: September 15, 2025
+# ==============================================================================
+"""
+Input individual SMILES strings or a list of SMILES strings to predict toxicity for
+Carcinogenicity and Genotoxicity.
+
+The model is developed for organic compounds associated with e-cigarettes. 
+
+The current prediction code is based on the RDKit physiochemical descriptors model and hyperparameters;
+if you would like to use a different FP type, please re-run the original training code "best_model_CarGen_multi-task",
+and generate a new .pth file with the desired FP
+"""
+#%% ============================================================================
+# Install Required Dependencies
+# ============================================================================
+# !pip install -q rdkit shap scikit-optimize torch torchvision -U
+#%% ============================================================================
+# Import Required Libraries
+# ============================================================================
+# Standard Libraries
+import pandas as pd
+import numpy as np
+import io, os
+import joblib
+
+# PyTorch Libraries
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# RDKit: Molecular Fingerprint & Descriptor Calculations
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem, MACCSkeys, RDKFingerprint, Descriptors
+from rdkit.Chem.AllChem import GetMorganGenerator
+from rdkit.DataStructs import ConvertToNumpyArray
+from rdkit.ML.Descriptors import MoleculeDescriptors
+
+# Feature Scaling for RDKit Descriptors
+from sklearn.preprocessing import MinMaxScaler
+
+#For usage in Google Colab
+# from google.colab import files
+#%% ============================================================================
+# Define the Neural Network Used
+# ============================================================================
+task_names = ['Cancer', 'Genotoxicity']
+mode = "Descriptors" # Warning: must match fingerprint used to train model. If using 'best_model_CarGen_multi-task.pth' This mode should be Descriptors
+
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_size, shared_layer_sizes, output_layer_sizes, specific_layer_sizes):
+        super(NeuralNetwork, self).__init__()
+        self.shared_layers = nn.ModuleList()
+        self.shared_layers.append(nn.Linear(input_size, shared_layer_sizes[0]))
+        for i in range(len(shared_layer_sizes) - 1):
+            self.shared_layers.append(nn.Linear(shared_layer_sizes[i], shared_layer_sizes[i + 1]))
+        self.output_layers = nn.ModuleList()
+        for output_size in output_layer_sizes:
+            specific_layers = nn.Sequential(
+                nn.Linear(shared_layer_sizes[-1], specific_layer_sizes[0]),
+                nn.ReLU(),
+                nn.Linear(specific_layer_sizes[0], output_size)
+            )
+            self.output_layers.append(specific_layers)
+
+    def forward(self, x):
+        for layer in self.shared_layers:
+            x = torch.relu(layer(x))
+        outputs = [output_layer(x) for output_layer in self.output_layers]
+        outputs = [torch.sigmoid(output_layer(x)) for output_layer in self.output_layers]
+        return outputs
+#%% ============================================================================
+# Upload Model File
+# ============================================================================
+# Paths to model and scaler files
+model_path = "best_model_CarGen_multi-task.pth"
+scaler_path = "descriptor_scaler.pkl"  # optional, only needed for Descriptors
+
+# uploaded = files.upload()  # Upload 'best_model_CarGen_multi-task.pth' and 'descriptors_scaler.pkl' (not needed unless mode == 'Descriptors')
+
+#%% ============================================================================
+# Load Model Architecture
+# ============================================================================
+checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
+trained_model = NeuralNetwork(
+    input_size=checkpoint['input_size'],
+    shared_layer_sizes=[checkpoint['params'][3]],
+    output_layer_sizes=[1, 1],  # match model
+    specific_layer_sizes=[checkpoint['params'][4], checkpoint['params'][4]]
+)
+trained_model.load_state_dict(checkpoint['model_state_dict'])
+
+# Load scaler if it exists
+if os.path.exists(scaler_path):
+    scaler = joblib.load("descriptor_scaler.pkl")
+else:
+    scaler = None
+
+#%% ============================================================================
+# Define Fingerprint Generation & Prediction functions
+# Warning: Please check that 'mode' is set to your desired FP type
+# ============================================================================
+# Function to convert smiles strings to fingerprint/descriptor vectors
+def smiles_to_feature(smiles, mode="MACCS", **kwargs):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        if mode == "MACCS":
+            return np.zeros(167, dtype=int)
+        elif mode in ["Morgan", "FCFP", "RDK"]:
+            fpSize = kwargs.get("fpSize", 2048)
+            return np.zeros(fpSize, dtype=int)
+        elif mode == "Descriptors":
+            desc_list = [desc[0] for desc in Descriptors._descList]
+            return np.zeros(len(desc_list))
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+    if mode == "MACCS":
+        fp = MACCSkeys.GenMACCSKeys(mol)
+        arr = np.zeros((167,), dtype=int)
+        ConvertToNumpyArray(fp, arr)
+        return arr
+
+    elif mode == "Morgan":
+        radius = kwargs.get("radius", 3)
+        fpSize = kwargs.get("fpSize", 2048)
+        generator = AllChem.GetMorganGenerator(radius=radius, fpSize=fpSize)
+        fp = generator.GetFingerprint(mol)
+        return np.array(fp)
+
+    elif mode == "FCFP": #Note: This method uses a deprecated version to generate FCFP that will be removed in future versions of RDKit
+        radius = kwargs.get("radius", 3)
+        fpSize = kwargs.get("fpSize", 2048)
+        include_chirality = kwargs.get("include_chirality", False)
+        invariants = AllChem.GetFeatureInvariants(mol)
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol, radius, nBits=fpSize, invariants=invariants, useChirality=include_chirality
+        )
+        arr = np.zeros(fpSize, dtype=int)
+        ConvertToNumpyArray(fp, arr)
+        return arr
+
+    elif mode == "RDK":
+        fpSize = kwargs.get("fpSize", 2048)
+        fp = RDKFingerprint(mol, fpSize=fpSize)
+        arr = np.zeros(fpSize, dtype=int)
+        ConvertToNumpyArray(fp, arr)
+        return arr
+
+    elif mode == "Descriptors":
+        desc_list = [desc[0] for desc in Descriptors._descList]
+        calc = MoleculeDescriptors.MolecularDescriptorCalculator(desc_list)
+        mol = Chem.AddHs(mol)
+        descriptors = calc.CalcDescriptors(mol)
+        return np.array(descriptors)
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+# Prediction Function
+def ecig_predict(smiles_input, task_names, trained_model,scaler=None):
+    if isinstance(smiles_input, str):
+        smiles_list = [smiles_input]
+    else:
+        smiles_list = smiles_input
+
+    X_input = np.array([smiles_to_feature(sm, mode=mode) for sm in smiles_list]) # uses fingerprint mode model was originally trained on
+    if mode == "Descriptors":
+        desc_names = ["RDKit_" + desc[0] for desc in Descriptors._descList]
+        X_input_df = pd.DataFrame(X_input, columns=desc_names)
+        X_input_df = X_input_df.replace([np.inf, -np.inf], np.nan).fillna(0)
+        if scaler is None:
+            raise ValueError(
+                "Scaler is required for descriptor-based models. Please provide the fitted scaler."
+            )
+        X_scaled = scaler.transform(X_input_df)
+        X_input_df = pd.DataFrame(X_scaled, columns=X_input_df.columns)
+
+    else:
+        # Fingerprint mode
+        X_input_df = pd.DataFrame(X_input, columns=[f'FP_{i}' for i in range(X_input.shape[1])])
+
+    X_tensor = torch.tensor(X_input_df.values, dtype=torch.float32)
+
+    trained_model.eval()
+    with torch.no_grad():
+        outputs = trained_model(X_tensor)
+
+    outputs_tensor = torch.stack(outputs, dim=1).squeeze()
+    predictions_np = outputs_tensor.numpy()
+    predictions_np = np.atleast_2d(predictions_np)
+
+    print(f"\n=== Prediction Results ===")
+    for i, sm in enumerate(smiles_list):
+        print(f"\nSMILES: {sm}")
+        for task_idx, task in enumerate(task_names):
+            prob = predictions_np[i][task_idx]
+            pred = 1 if prob > 0.5 else 0
+            interpretation = "TOXIC response predicted" if pred == 1 else "NON-TOXIC response predicted"
+            print(f"Task: {task}")
+            print(f"  Prediction: {pred} ({interpretation})")
+            print(f"  Confidence: {prob:.2%}")
+
+#%% ============================================================================
+# Make Predictions!
+# ============================================================================
+
+# === INPUT SMILES HERE  ===
+smiles_input = ["CC=O"]
+
+# === Make Predictions  ===
+ecig_predict(smiles_input, task_names=['Cancer', 'Genotoxicity'], trained_model=trained_model, scaler=scaler)
